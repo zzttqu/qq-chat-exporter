@@ -1320,7 +1320,7 @@ async fn process_export_task(
             .and_then(Value::as_bool)
             .unwrap_or(true),
         sender_title_resolver,
-        forward_fetcher: None,
+        forward_fetcher: Some(Arc::new(state.napcat.clone())),
     });
     let mut clean_messages: Vec<CleanMessage> = parser.parse_messages(&filtered_messages).await;
 

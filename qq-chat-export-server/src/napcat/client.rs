@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::fetcher::{MessageFetchApi, Peer};
+use crate::parser::ForwardFetcher;
 
 /// bridge 调用错误。
 #[derive(Debug, thiserror::Error)]
@@ -149,10 +150,19 @@ impl NapCatBridgeClient {
         &self,
         peer: &Value,
         root_msg_id: &str,
-        parent_msg_id: &str,
+        res_id: &str,
     ) -> Result<Value, BridgeError> {
-        self.call("MsgApi.getMultiMsg", json!([peer, root_msg_id, parent_msg_id]))
-            .await
+        self.call(
+            "MsgApi.getMultiMsg",
+            json!([{
+                "peer": peer,
+                "rootMsgId": root_msg_id,
+                "parentMsgId": root_msg_id,
+                "forwardId": res_id,
+                "resId": res_id,
+            }]),
+        )
+        .await
     }
 
     /// 下载媒体资源，返回本地路径。
@@ -320,4 +330,116 @@ fn peer_to_value(peer: &Peer) -> Value {
         "peerUid": peer.peer_uid,
         "guildId": peer.guild_id.clone().unwrap_or_default(),
     })
+}
+
+#[async_trait::async_trait]
+impl ForwardFetcher for NapCatBridgeClient {
+    async fn get_multi_msg(
+        &self,
+        chat_type: i64,
+        peer_uid: &str,
+        root_msg_id: &str,
+        res_id: &str,
+    ) -> Option<Vec<Value>> {
+        if peer_uid.is_empty() || root_msg_id.is_empty() || res_id.is_empty() {
+            return None;
+        }
+
+        let peer = json!({
+            "chatType": chat_type,
+            "peerUid": peer_uid,
+            "guildId": "",
+        });
+        let result = NapCatBridgeClient::get_multi_msg(self, &peer, root_msg_id, res_id)
+            .await
+            .ok()?;
+        result
+            .get("msgList")
+            .or_else(|| result.get("messages"))
+            .and_then(Value::as_array)
+            .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    use super::NapCatBridgeClient;
+    use crate::parser::ForwardFetcher;
+
+    #[tokio::test]
+    async fn forward_fetcher_sends_forward_context_and_reads_msg_list() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("test listener address");
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("bridge accepts request");
+            let mut buffer = vec![0_u8; 8 * 1024];
+            let size = socket
+                .read(&mut buffer)
+                .await
+                .expect("bridge reads request");
+            let request = String::from_utf8(buffer[..size].to_vec()).expect("request is UTF-8");
+            request_tx
+                .send(request)
+                .expect("request receiver remains open");
+
+            let body = json!({
+                "id": 1,
+                "ok": true,
+                "result": { "msgList": [{ "msgId": "inner-1" }] }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("bridge writes response");
+        });
+
+        let client = Arc::new(
+            NapCatBridgeClient::new(&format!("http://{address}"), 1_000)
+                .expect("bridge client is created"),
+        );
+        let messages = ForwardFetcher::get_multi_msg(
+            client.as_ref(),
+            2,
+            "group://42",
+            "outer-1",
+            "forward-res-1",
+        )
+        .await
+        .expect("bridge returns inner messages");
+
+        assert_eq!(messages, vec![json!({ "msgId": "inner-1" })]);
+
+        let request = request_rx.await.expect("request captured");
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request body exists");
+        let payload: serde_json::Value = serde_json::from_str(body).expect("request body is JSON");
+        assert_eq!(payload["method"], "MsgApi.getMultiMsg");
+        assert_eq!(
+            payload["params"][0],
+            json!({
+                "peer": { "chatType": 2, "peerUid": "group://42", "guildId": "" },
+                "rootMsgId": "outer-1",
+                "parentMsgId": "outer-1",
+                "forwardId": "forward-res-1",
+                "resId": "forward-res-1"
+            })
+        );
+    }
 }

@@ -181,7 +181,7 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             sender_title_resolver: None,
-            forward_fetcher: None,
+            forward_fetcher: Some(Arc::new(self.napcat.clone())),
         });
         let mut clean_messages: Vec<CleanMessage> = parser.parse_messages(&all_messages).await;
 
